@@ -114,7 +114,7 @@ def fetch_revocation_info(cert, crls_dir):
         for point in crl_dist_points:
             for name in point.full_name:
                 if name.value.startswith("http"):
-                    print(f"Fetching CRL from: {name.value}")
+                    #print(f"Fetching CRL from: {name.value}")
                     response = session.get(name.value, timeout=10)
                     if response.status_code == 200:
                         # Save the CRL to the crls directory
@@ -122,7 +122,7 @@ def fetch_revocation_info(cert, crls_dir):
                         crl_path = os.path.join(crls_dir, crl_filename)
                         with open(crl_path, 'wb') as crl_file:
                             crl_file.write(response.content)
-                        print(f"Saved CRL to: {crl_path}")
+                        #print(f"Saved CRL to: {crl_path}")
 
                         # Load and process the CRL
                         crl = x509.load_der_x509_crl(response.content, default_backend())
@@ -150,9 +150,9 @@ def lint_certificate(encoded_cert):
     except Exception as e:
         return f"Linting error: {e}"
 
-def process_certificate(cert_path, errors_dir, revoked_dir, results_csv_path):
+def process_certificate(cert_path, errors_dir, revoked_dir, crls_dir, results_csv_path):
     try:
-        print(f"Processing certificate file: {cert_path}")
+        #print(f"Processing certificate file: {cert_path}")
         with open(cert_path, 'rb') as f:
             pem_data = f.read()
 
@@ -160,19 +160,20 @@ def process_certificate(cert_path, errors_dir, revoked_dir, results_csv_path):
         sha256_hash = hashlib.sha256(cert.tbs_certificate_bytes).hexdigest()
 
         cert_details = extract_certificate_details(cert)
-        print(f"Certificate details: SHA256={sha256_hash}, Issuer={cert_details['Issuer']}")
+        #print(f"Certificate details: SHA256={sha256_hash}, Issuer={cert_details['Issuer']}")
 
         # Perform linting
         linting_result = lint_certificate(base64.b64encode(cert.public_bytes(serialization.Encoding.DER)).decode())
         if not linting_result:
-            print(f"No linting errors found for certificate: {sha256_hash}")
+            #print(f"No linting errors found for certificate: {sha256_hash}")
             os.remove(cert_path)  # Remove certificates without linting errors
             return
 
-        print(f"Linting errors found for certificate: {sha256_hash}")
+        print(f" - Linting errors found for certificate: {sha256_hash}")
 
         # Perform revocation checking only if linting errors are present
-        revocation_status, revocation_reason, revocation_date = fetch_revocation_info(cert)
+        revocation_status, revocation_reason, revocation_date = fetch_revocation_info(cert, crls_dir)
+        #print(f"Revocation status: {revocation_status}, reason: {revocation_reason}, date: {revocation_date}")
 
         # Prepare the CSV row
         row = {
@@ -190,11 +191,15 @@ def process_certificate(cert_path, errors_dir, revoked_dir, results_csv_path):
 
         # Move the certificate based on revocation status
         if revocation_status == "REVOKED":
-            shutil.move(cert_path, os.path.join(revoked_dir, os.path.basename(cert_path)))
+            target_path = os.path.join(revoked_dir, os.path.basename(cert_path))
+            #print(f"Moving revoked certificate to: {target_path}")
+            shutil.move(cert_path, target_path)
         else:
-            shutil.move(cert_path, os.path.join(errors_dir, os.path.basename(cert_path)))
+            target_path = os.path.join(errors_dir, os.path.basename(cert_path))
+            #print(f"Moving certificate with errors to: {target_path}")
+            shutil.move(cert_path, target_path)
 
-        print(f"Processed and logged certificate: {sha256_hash}")
+        #print(f"Processed and logged certificate: {sha256_hash}")
 
     except Exception as e:
         print(f"Error processing certificate {cert_path}: {e}")
@@ -215,10 +220,10 @@ def fetch_certificates_from_ct(results_dir):
                         url = log.get("url")
                         if url:
                             urls.append(url)
-                print(f"Fetched {len(urls)} CT log URLs.")
+                print(f"Detected {len(urls)} CT log URLs.")
                 return urls
             else:
-                print(f"Failed to fetch log list from {log_list_url}. Status code: {response.status_code}")
+                print(f" - *Failed* to fetch log list from {log_list_url}. Status code: {response.status_code}")
                 return []
         except Exception as e:
             print(f"Error fetching CT log list: {str(e)}")
@@ -231,12 +236,12 @@ def fetch_certificates_from_ct(results_dir):
             return
 
         for ct_log_url in ct_logs:
-            print(f"Fetching certificates from CT log: {ct_log_url}")
+            print(f" - Fetching certificates from CT log: {ct_log_url}")
             try:
                 sth_url = f"{ct_log_url}/ct/v1/get-sth"
                 response = requests.get(sth_url)
                 if response.status_code != 200:
-                    print(f"Failed to fetch STH for {ct_log_url}. Status code: {response.status_code}")
+                    print(f" - *Failed* to fetch STH for {ct_log_url}. Status code: {response.status_code}")
                     continue
 
                 tree_size = response.json().get("tree_size", 0)
@@ -299,6 +304,15 @@ def extract_cert_from_ct_entry(leaf_input, extra_data):
         print(f"Error extracting certificate from CT entry: {str(e)}")
         return None
 
+def copy_certificates_to_results(src_dir, results_dir):
+    certs_dir = os.path.join(results_dir, "certificates")
+    os.makedirs(certs_dir, exist_ok=True)
+    for filename in os.listdir(src_dir):
+        file_path = os.path.join(src_dir, filename)
+        if os.path.isfile(file_path):
+            shutil.copy(file_path, certs_dir)
+
+
 def is_certificate_valid(cert):
     now = datetime.now(timezone.utc)
     if cert.not_valid_before_utc > now or cert.not_valid_after_utc < now:
@@ -319,13 +333,14 @@ def lint_certificates_in_directory(results_dir):
     certs_dir = os.path.join(results_dir, "certificates")
     errors_dir = os.path.join(results_dir, "errors")
     revoked_dir = os.path.join(errors_dir, "revoked")
+    crls_dir = os.path.join(results_dir, "crls")  # Correct CRLs directory
     results_csv_path = initialize_results_csv(results_dir)
 
     def status_indicator():
         while True:
             time.sleep(10)
             remaining_files = len(os.listdir(certs_dir))
-            print(f"Certificates remaining to process: {remaining_files}")
+            print(f"\nCertificates remaining to process: {remaining_files}\n")
             if remaining_files == 0:
                 break
 
@@ -336,29 +351,30 @@ def lint_certificates_in_directory(results_dir):
     for cert_file in os.listdir(certs_dir):
         cert_path = os.path.join(certs_dir, cert_file)
         if os.path.isfile(cert_path):
-            process_certificate(cert_path, errors_dir, revoked_dir, results_csv_path)
+            process_certificate(cert_path, errors_dir, revoked_dir, crls_dir, results_csv_path)
 
 def main():
     args = parse_arguments()
 
     results_dir = setup_results_directory(args.results_dir)
-    print(f"Results will be stored in: {results_dir}")
+    print(f"\nResults will be stored in: {results_dir}")
 
     if args.ct:
-        print("Lint certificates from Certificate Transparency logs: -ct")
+        print("\nLint certificates from Certificate Transparency logs: -ct\n")
         fetch_certificates_from_ct(results_dir)
     elif args.dir:
-        print(f"Lint b64-encoded certificates in a directory: {args.dir}")
+        print(f"\nLint b64-encoded certificates in a directory: {args.dir}\n")
         copy_certificates_to_results(args.dir, results_dir)
         lint_certificates_in_directory(results_dir)
     elif args.csv:
-        print(f"Lint certificates from a CSV file produced by PKI Monitoring: {args.csv}")
+        print(f"\nLint certificates from a CSV file produced by PKI Monitoring: {args.csv}\n")
         process_csv_file(args.csv, results_dir)
 
     if args.check_status:
-        print("Certificate status checking enabled.")
+        print("\nRevocation checks performed for all certificates.\n")
     else:
-        print("Certificate status checking not enabled.")
+        print("\nRevocation checks performed for certificates with errors.\n")
+
 
 if __name__ == "__main__":
     main()
